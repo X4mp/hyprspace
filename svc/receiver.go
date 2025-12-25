@@ -5,6 +5,7 @@ import (
 
 	"github.com/hyprspace/hyprspace/config"
 	"github.com/libp2p/go-libp2p/core/network"
+	"go.uber.org/zap"
 )
 
 func (sn *ServiceNetwork) streamHandler() func(network.Stream) {
@@ -23,6 +24,23 @@ func (sn *ServiceNetwork) streamHandler() func(network.Stream) {
 		}
 		svcId := [2]byte(buf)
 		if proxy, ok := sn.listeners[svcId]; ok {
+			remotePeer := stream.Conn().RemotePeer()
+			if _, ok := sn.acl[svcId]; ok {
+				if sn.acl[svcId].Blacklist != nil {
+					if _, isBlacklisted := sn.acl[svcId].Blacklist[remotePeer]; isBlacklisted {
+						logger.With(zap.ByteString("service ID", svcId[:])).Warn("Connection from blacklisted peer")
+						stream.Reset()
+						return
+					}
+				}
+			}
+			// TODO check whitelist
+			//
+			//
+			//
+			//
+			//
+			//
 			_, err := stream.Write([]byte{byte(RS_OK)})
 			if err != nil {
 				logger.With(err).Error("Failed to write stream")

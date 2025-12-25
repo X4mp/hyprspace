@@ -54,8 +54,8 @@ type RouteTableEntry struct {
 // If Blacklist is set, this will be evaluated first and any client id present in Blacklist will
 // have access denied. Whitelist is evaluated after.
 type ServiceACL struct {
-	Whitelist []string
-	Blacklist []string
+	Whitelist map[peer.ID]interface{}
+	Blacklist map[peer.ID]interface{}
 }
 
 func (rte RouteTableEntry) Network() net.IPNet {
@@ -170,6 +170,7 @@ func Read(path string) (*Config, error) {
 func FindPeer(peers []Peer, needle peer.ID) (*Peer, bool) {
 	for _, p := range peers {
 		if p.ID == needle {
+
 			return &p, true
 		}
 	}

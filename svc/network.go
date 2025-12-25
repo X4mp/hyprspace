@@ -30,11 +30,13 @@ type ServiceNetwork struct {
 	activeAddrs  map[[16]byte]struct{}
 	activePorts  map[[16]byte]map[uint16]struct{}
 	listeners    map[[2]byte]Proxy
+	acl          map[[2]byte]config.ServiceACL
 }
 
 func (sn *ServiceNetwork) Register(serviceName string, proxy Proxy) {
 	svcId := config.MkServiceID(serviceName)
 	sn.listeners[svcId] = proxy
+	sn.acl[svcId] = sn.config.ServicesACL[serviceName]
 	logger.With(zap.String("name", serviceName), zap.ByteString("id", svcId[:]), zap.String("description", proxy.Description)).Debug("Registered service")
 }
 
