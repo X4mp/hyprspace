@@ -4,7 +4,7 @@
 //
 // Build with:
 //
-//	gomobile bind -javapkg hyprspace -target=android -androidapi 26 -o hyprspace.aar ./mobile
+//	gomobile bind -ldflags "-checklinkname=0" -javapkg hyprspace -target=android -androidapi 26 -o hyprspace.aar ./mobile
 package mobile
 
 import (
@@ -270,6 +270,7 @@ func StartNode(fd int, configPath string, events Events) (*Node, error) {
 		ctx,
 		cfg.PrivateKey,
 		cfg.ListenAddresses,
+		cfg.BootstrapPeers,
 		n.streamHandler,
 		p2p.NewClosedCircuitRelayFilter(cfg.Peers),
 		gater,
@@ -447,7 +448,7 @@ func (n *Node) sendPacket(dst peer.ID, packet []byte, plen int) {
 		n.streamsMu.Unlock()
 	}
 
-	stream, err := n.host.NewStream(n.ctx, dst, p2p.Protocol)
+	stream, err := n.host.NewStream(n.ctx, dst, p2p.ProtocolV1)
 	if err != nil {
 		logger.With(zap.String("dst", dst.String()), zap.Error(err)).Error("Failed to open stream")
 		go p2p.Rediscover()
