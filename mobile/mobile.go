@@ -8,9 +8,13 @@
 package mobile
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -34,7 +38,24 @@ import (
 	"go.uber.org/zap"
 )
 
-var logger = log.Logger("hyprspace/mobile")
+// PingProtocolID is the libp2p stream protocol for ping/echo testing.
+const PingProtocolID = "/hyprspace/ping/1.0.0"
+
+// PingResult holds the result of a ping round-trip.
+type PingResult struct {
+	// LatencyMs is the round-trip latency in milliseconds.
+	LatencyMs float64
+	// Success indicates whether the echo payload matched.
+	Success bool
+	// Error is non-empty if the ping failed for a reason other than connection failure.
+	Error string
+}
+
+var (
+	logger = log.Logger("hyprspace/mobile")
+	// currentNode holds the most recently started node, exported for tests.
+	currentNode *Node
+)
 
 // Identity is this node's stable cryptographic identity, returned by
 // GenerateIdentity for first-launch config creation.
@@ -52,6 +73,44 @@ type Identity struct {
 // this key (use GetVPNConfig for the addresses after the file is written).
 func GenerateIdentity() (*Identity, error) {
 	privKey, _, err := crypto.GenerateKeyPair(crypto.Ed25519, 256)
+	if err != nil {
+		return nil, err
+	}
+	keyBytes, err := crypto.MarshalPrivateKey(privKey)
+	if err != nil {
+		return nil, err
+	}
+	peerID, err := peer.IDFromPrivateKey(privKey)
+	if err != nil {
+		return nil, err
+	}
+	return &Identity{
+		PrivateKey: multibase.MustNewEncoder(multibase.Base58BTC).Encode(keyBytes),
+		PeerID:     peerID.String(),
+	}, nil
+}
+
+// PingNode sends a payload to a remote peer over a dedicated libp2p stream
+// and reads the echo response. This is an exported helper for integration tests
+// that need to verify data-plane connectivity through the currently running node.
+func PingNode(peerIDString string, payload string) *PingResult {
+	n := currentNode
+	if n == nil {
+		return &PingResult{
+			Error: "no node running",
+		}
+	}
+	return n.Ping(peerIDString, payload)
+}
+
+// DeriveIdentity deterministically derives an Ed25519 identity from a seed string.
+// It uses SHA-256 of the seed as the randomness source for Ed25519 key generation,
+// so the same seed always produces the same key pair. Call it once on first launch
+// and persist PrivateKey in the config's "privateKey" field.
+func DeriveIdentity(seed string) (*Identity, error) {
+	hash := sha256.Sum256([]byte(seed))
+	reader := bytes.NewReader(hash[:])
+	privKey, _, err := crypto.GenerateKeyPairWithReader(crypto.Ed25519, 256, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -283,6 +342,8 @@ func StartNode(fd int, configPath string, events Events) (*Node, error) {
 	}
 
 	n.host.SetStreamHandler(p2p.PeXProtocol, p2p.NewPeXStreamHandler(n.host, cfg))
+	n.host.SetStreamHandler(PingProtocolID, n.pingHandler)
+	currentNode = n
 
 	for _, p := range cfg.Peers {
 		n.host.ConnManager().Protect(p.ID, "/hyprspace/peer")
@@ -335,6 +396,7 @@ func (n *Node) Stop() error {
 
 	n.emit("stopped", "")
 	logger.With(zap.Duration("elapsed", time.Since(started))).Info("Mobile node stopped")
+	currentNode = nil
 	return err
 }
 
@@ -487,4 +549,87 @@ func (passthroughGater) InterceptSecured(_ network.Direction, _ peer.ID, _ netwo
 }
 func (passthroughGater) InterceptUpgraded(_ network.Conn) (bool, control.DisconnectReason) {
 	return true, 0
+}
+
+// pingHandler echoes back any payload received on the ping protocol.
+func (n *Node) pingHandler(stream network.Stream) {
+	var respLen uint16
+	if err := binary.Read(stream, binary.LittleEndian, &respLen); err != nil {
+		stream.Close()
+		return
+	}
+	respBuf := make([]byte, respLen)
+	if _, err := io.ReadFull(stream, respBuf); err != nil {
+		stream.Close()
+		return
+	}
+
+	if _, err := stream.Write(respBuf); err != nil {
+		stream.Close()
+		return
+	}
+	stream.Close()
+}
+
+// Ping sends a payload to a remote peer over a dedicated libp2p stream
+// and reads the echo response. Returns the round-trip latency.
+func (n *Node) Ping(peerIDString string, payload string) *PingResult {
+	peerID, err := peer.Decode(peerIDString)
+	if err != nil {
+		return &PingResult{
+			Error: fmt.Sprintf("invalid peer ID: %v", err),
+		}
+	}
+
+	stream, err := n.host.NewStream(n.ctx, peerID, PingProtocolID)
+	if err != nil {
+		return &PingResult{
+			Error: fmt.Sprintf("failed to open stream: %v", err),
+		}
+	}
+	defer stream.Close()
+
+	start := time.Now()
+
+	payloadBytes := []byte(payload)
+
+	// Write length-prefixed payload
+	if err := binary.Write(stream, binary.LittleEndian, uint16(len(payloadBytes))); err != nil {
+		return &PingResult{
+			Error: fmt.Sprintf("failed to write payload: %v", err),
+		}
+	}
+	if _, err := stream.Write(payloadBytes); err != nil {
+		return &PingResult{
+			Error: fmt.Sprintf("failed to send payload: %v", err),
+		}
+	}
+
+	// Read length-prefixed response
+	var respLen uint16
+	if err := binary.Read(stream, binary.LittleEndian, &respLen); err != nil {
+		return &PingResult{
+			Error: fmt.Sprintf("failed to read response length: %v", err),
+		}
+	}
+	respBuf := make([]byte, respLen)
+	if _, err := io.ReadFull(stream, respBuf); err != nil {
+		return &PingResult{
+			Error: fmt.Sprintf("failed to read response: %v", err),
+		}
+	}
+
+	elapsed := time.Since(start)
+	success := string(respBuf) == payload
+
+	errStr := ""
+	if !success {
+		errStr = fmt.Sprintf("echo mismatch: expected %q, got %q", payload, string(respBuf))
+	}
+
+	return &PingResult{
+		LatencyMs: float64(elapsed.Microseconds()) / 1000.0,
+		Success:   success,
+		Error:     errStr,
+	}
 }
